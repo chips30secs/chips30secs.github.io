@@ -152,150 +152,228 @@ const NOTES = {
   "Forrest":"Very few sales per year, all large prestige homes; the median moves a lot."
 };
 
-// ---------- MAP ----------
-const map=L.map('map',{zoomControl:false,attributionControl:true}).setView([-35.30,149.10],11);
-L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{
-  maxZoom:19,
-  attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-}).addTo(map);
+// =====================================================================
+//  Canberra Property Map — real suburb boundaries
+//  Algorithms: shoelace area + centroid, ray-casting point-in-polygon,
+//  log colour scale. Boundaries: Geoscape/PSMA (CC BY 4.0).
+// =====================================================================
+const PRICE={}; S.forEach(s=>{ if(s.price) PRICE[s.name.toUpperCase()]=s; });
 
-const cityBounds=L.latLngBounds(S.map(s=>[s.lat,s.lng])).pad(0.05);
-map.fitBounds(cityBounds);
+// ---------- geometry helpers ----------
+const R=6371008.8, toRad=Math.PI/180;
+function rings(g){ return g.type==='Polygon'?[g.coordinates]:g.coordinates; } // list of polygons, each = [outer, ...holes]
+// project lng/lat to local metres (good enough within a city)
+function proj([lng,lat]){ return [lng*toRad*R*Math.cos(-35.3*toRad), lat*toRad*R]; }
+// shoelace formula: signed area + centroid of one ring
+function ringStats(ring){
+  let a=0,cx=0,cy=0;
+  for(let i=0,n=ring.length-1;i<n;i++){
+    const [x1,y1]=proj(ring[i]), [x2,y2]=proj(ring[i+1]);
+    const c=x1*y2-x2*y1; a+=c; cx+=(x1+x2)*c; cy+=(y1+y2)*c;
+  }
+  a/=2; return {a, cx:cx/(6*a), cy:cy/(6*a)};
+}
+function polyStats(g){
+  let A=0,X=0,Y=0;
+  rings(g).forEach(poly=>poly.forEach((ring,k)=>{
+    const s=ringStats(ring), sign=k===0?1:-1, area=Math.abs(s.a)*sign;
+    A+=area; X+=s.cx*area; Y+=s.cy*area;
+  }));
+  const x=X/A, y=Y/A;
+  return {area:A, center:[ (y/R)/toRad, (x/(R*Math.cos(-35.3*toRad)))/toRad ]}; // [lat,lng]
+}
+// ray casting: count how many edges a ray going right from the point crosses
+function inRing(pt,ring){
+  const [x,y]=pt; let inside=false;
+  for(let i=0,j=ring.length-1;i<ring.length;j=i++){
+    const [xi,yi]=ring[i],[xj,yj]=ring[j];
+    if(((yi>y)!==(yj>y)) && (x < (xj-xi)*(y-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+function inPoly(pt,g){
+  return rings(g).some(poly=> inRing(pt,poly[0]) && !poly.slice(1).some(h=>inRing(pt,h)));
+}
+function bbox(g){let a=[1e9,1e9,-1e9,-1e9];rings(g).forEach(p=>p[0].forEach(([x,y])=>{a[0]=Math.min(a[0],x);a[1]=Math.min(a[1],y);a[2]=Math.max(a[2],x);a[3]=Math.max(a[3],y);}));return a;}
+function inBox(pt,b){return pt[0]>=b[0]&&pt[0]<=b[2]&&pt[1]>=b[1]&&pt[1]<=b[3];}
 
-// colour scale (log) teal -> yellow -> orange -> red
+// ---------- colour ----------
 const stops=["#2f8fb0","#36b39f","#e9c046","#ec8a3a","#d63a4f"];
 function lerp(a,b,t){const pa=parseInt(a.slice(1),16),pb=parseInt(b.slice(1),16);
   const r=(pa>>16)+((pb>>16)-(pa>>16))*t,g=((pa>>8)&255)+(((pb>>8)&255)-((pa>>8)&255))*t,bl=(pa&255)+((pb&255)-(pa&255))*t;
   return '#'+((1<<24)+(Math.round(r)<<16)+(Math.round(g)<<8)+Math.round(bl)).toString(16).slice(1);}
 function color(p){let t=(Math.log(p)-Math.log(400000))/(Math.log(2500000)-Math.log(400000));t=Math.max(0,Math.min(1,t));
   const i=Math.min(stops.length-2,Math.floor(t*(stops.length-1)));return lerp(stops[i],stops[i+1],t*(stops.length-1)-i);}
-
-// soft heat blobs (stacked translucent circles)
-const heat=L.layerGroup().addTo(map);
-S.filter(s=>s.price).forEach(s=>{
-  const c=color(s.price);
-  [[1100,.10],[750,.14],[420,.18]].forEach(([r,o])=>L.circle([s.lat,s.lng],{radius:r,stroke:false,fillColor:c,fillOpacity:o,interactive:false}).addTo(heat));
-});
-let heatOn=true;
-document.getElementById('layers').onclick=()=>{heatOn=!heatOn; heatOn?heat.addTo(map):heat.remove();};
-
-// price pins
 const fmt=v=>v>=1e6?'$'+(v/1e6).toFixed(v>=1e7?1:2).replace(/0$/,'')+'M':'$'+Math.round(v/1000)+'k';
-const markers=S.map(s=>{
-  const m=L.marker([s.lat,s.lng],{icon:pinIcon(s,false),riseOnHover:true}).on('click',()=>selectSuburb(s,true));
-  s.marker=m; return m;
+
+// ---------- map ----------
+const map=L.map('map',{zoomControl:false}).setView([-35.30,149.10],11);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,
+  attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · Boundaries &copy; Geoscape Australia (CC BY 4.0)'}).addTo(map);
+
+const sheet=document.getElementById('sheet');
+function setSheetH(){document.documentElement.style.setProperty('--sheet',sheet.offsetHeight+'px');}
+sheet.innerHTML='<div class="grab"></div><h2>Loading suburbs…</h2>'; setSheetH();
+
+let SUBS=[], DISTS=[], selected=null, fillLayer, distLayer, pinLayer, nameLayer, cityBounds;
+const DIST_NAME={"Canberra Central":"Inner Canberra"};
+
+fetch('suburbs.json').then(r=>r.json()).then(init).catch(e=>{
+  sheet.innerHTML='<div class="grab"></div><h2>Could not load suburb boundaries</h2><div class="sub">'+e+'</div>'; setSheetH();
 });
+
+function init(fc){
+  fc.features.forEach(f=>{
+    const st=polyStats(f.geometry), o={name:f.properties.name, geom:f.geometry, box:bbox(f.geometry), area:st.area, center:st.center, feature:f};
+    (f.properties.kind==='district'?DISTS:SUBS).push(o);
+  });
+  // assign each suburb to a district with point-in-polygon on its centroid
+  SUBS.forEach(s=>{
+    const pt=[s.center[1],s.center[0]];
+    const d=DISTS.find(d=>inBox(pt,d.box)&&inPoly(pt,d.geom));
+    s.district=d?(DIST_NAME[d.name]||d.name):'Outer ACT';
+    const p=PRICE[s.name.toUpperCase()]; if(p){s.price=p.price; s.src=p.src;}
+  });
+  DISTS.forEach(d=>{
+    d.label=DIST_NAME[d.name]||d.name;
+    const ps=SUBS.filter(s=>s.district===d.label&&s.price).map(s=>s.price).sort((a,b)=>a-b);
+    d.median=ps.length?ps[Math.floor(ps.length/2)]:null; d.n=ps.length;
+  });
+
+  // suburb fills (non-interactive: taps go through our own point-in-polygon test)
+  fillLayer=L.geoJSON({type:'FeatureCollection',features:SUBS.map(s=>s.feature)},{
+    interactive:false,
+    style:f=>{const s=SUBS.find(x=>x.feature===f);return {color:'#ffffff',weight:1.2,fillColor:s.price?color(s.price):'#9aa3ad',fillOpacity:s.price?.5:.15};}
+  }).addTo(map);
+  SUBS.forEach(s=>{ fillLayer.eachLayer(l=>{ if(l.feature===s.feature) s.layer=l; }); });
+
+  distLayer=L.layerGroup();
+  DISTS.forEach(d=>{
+    L.geoJSON(d.feature,{interactive:false,style:{color:'#222',weight:2.2,dashArray:'6 5',fill:false}}).addTo(distLayer);
+    const lab=L.marker(d.center,{icon:L.divIcon({className:'',iconSize:[0,0],
+      html:`<div class="pin" style="--c:${d.median?color(d.median):'#bbb'};font-size:13px;padding:6px 12px">${d.label}<b>${d.median?'median '+fmt(d.median):'no data'}</b></div>`})});
+    lab.on('click',()=>map.flyToBounds(L.geoJSON(d.feature).getBounds(),{duration:.8})); lab.addTo(distLayer);
+  });
+
+  pinLayer=L.layerGroup(); nameLayer=L.layerGroup();
+  SUBS.forEach(s=>{
+    s.marker=L.marker(s.center,{icon:pinIcon(s,false)}).on('click',()=>selectSuburb(s,true));
+    (s.price?pinLayer:nameLayer).addLayer(s.marker);
+  });
+
+  cityBounds=L.geoJSON({type:'FeatureCollection',features:DISTS.map(d=>d.feature)}).getBounds();
+  map.fitBounds(cityBounds);
+  map.on('zoomend',onZoom); onZoom();
+  showCity();
+}
+
 function pinIcon(s,sel){
   const cls='pin'+(s.price?'':' nod')+(sel?' sel':'');
-  const html=`<div class="${cls}" style="--c:${s.price?color(s.price):'#bbb'}">${s.price?fmt(s.price):'—'}<b>${s.name}</b></div>`;
+  const html=s.price||sel?`<div class="${cls}" style="--c:${s.price?color(s.price):'#bbb'}">${s.price?fmt(s.price):s.name}${s.price?`<b>${s.name}</b>`:''}</div>`
+    :`<div class="pin nod" style="font-size:10px;padding:2px 7px">${s.name}</div>`;
   return L.divIcon({html,className:'',iconSize:[0,0]});
 }
-const pinLayer=L.layerGroup(markers);
-function updatePins(){
+
+function onZoom(){
   const z=map.getZoom();
-  if(z>=12){ if(!map.hasLayer(pinLayer)) pinLayer.addTo(map); }
-  else { if(map.hasLayer(pinLayer)) pinLayer.remove(); if(selected) selected.marker.addTo(map); }
+  z<12? distLayer.addTo(map): distLayer.remove();
+  z>=12? pinLayer.addTo(map): pinLayer.remove();
+  z>=14? nameLayer.addTo(map): nameLayer.remove();
+  const op=z>=16?.12:z>=15?.25:z>=12?.42:.55;
+  SUBS.forEach(s=>s.layer.setStyle({fillOpacity:s.price?op:Math.min(op,.15)}));
+  if(selected){ selected.marker.addTo(map); selected.layer.setStyle({fillOpacity:Math.max(.08,op-.15)}); }
 }
-map.on('zoomend',updatePins); updatePins();
 
-// district labels at city zoom
-const districts={};S.forEach(s=>{(districts[s.district]=districts[s.district]||[]).push(s);});
-const distLayer=L.layerGroup(Object.entries(districts).map(([name,list])=>{
-  const lat=list.reduce((a,s)=>a+s.lat,0)/list.length, lng=list.reduce((a,s)=>a+s.lng,0)/list.length;
-  const withP=list.filter(s=>s.price).map(s=>s.price).sort((a,b)=>a-b);
-  const med=withP.length?withP[Math.floor(withP.length/2)]:null;
-  return L.marker([lat,lng],{icon:L.divIcon({className:'',iconSize:[0,0],
-    html:`<div class="pin" style="--c:${med?color(med):'#bbb'};font-size:13px;padding:6px 12px">${name}<b>${med?'median '+fmt(med):'no data'}</b></div>`})})
-    .on('click',()=>map.flyToBounds(L.latLngBounds(list.map(s=>[s.lat,s.lng])).pad(0.3),{duration:.8}));
-}));
-function updateDist(){ map.getZoom()<12? distLayer.addTo(map): distLayer.remove(); }
-map.on('zoomend',updateDist); updateDist();
-
-// ---------- SHEET ----------
-const sheet=document.getElementById('sheet');
-const ranked=S.filter(s=>s.price).sort((a,b)=>b.price-a.price);
-function setSheetH(){document.documentElement.style.setProperty('--sheet',sheet.offsetHeight+'px');}
-const legend=`<div class="legend">$400k <i style="background:linear-gradient(90deg,${stops.join(',')})"></i> $2.5M+</div>`;
-
-function showCity(){
-  sheet.innerHTML=`<div class="grab"></div>
-    <h2>Canberra</h2>
-    <div class="sub">Median house ${fmt(CITY.house)} · units ${fmt(CITY.unit)} · <span class="down">${CITY.yoy}% / yr</span></div>
-    ${legend}
-    <div class="note" style="text-align:center">Tap a district or suburb. Zoom right in to see streets and buildings.</div>
-    <details style="margin-top:8px"><summary style="font-size:13px;cursor:pointer">Most and least expensive suburbs</summary>
-      ${ranked.slice(0,5).map(r).join('')}<div style="height:6px"></div>${ranked.slice(-5).reverse().map(r).join('')}
-    </details>
-    <div class="note">City figures: <a href="${CITY.url}">${CITY.src}</a>. Suburb pins sit at approximate suburb centres.</div>`;
-  bindRows(); setSheetH();
-  document.getElementById('pillVal').textContent=fmt(CITY.house);
+// ---------- selection ----------
+function suburbAt(latlng){
+  const pt=[latlng.lng,latlng.lat];
+  return SUBS.find(s=>inBox(pt,s.box)&&inPoly(pt,s.geom));
 }
-function r(s){return `<div class="row" data-id="${s.id}"><span>${s.name}</span><b>${fmt(s.price)}</b></div>`;}
-function bindRows(){sheet.querySelectorAll('[data-id]').forEach(el=>el.onclick=()=>selectSuburb(S[+el.dataset.id],true));}
+map.on('click',e=>{ const s=suburbAt(e.latlng); if(s) selectSuburb(s,map.getZoom()<13); });
 
-let selected=null;
+function ranked(){return SUBS.filter(s=>s.price).sort((a,b)=>b.price-a.price);}
 function selectSuburb(s,fly){
-  if(selected) selected.marker.setIcon(pinIcon(selected,false));
+  if(selected){ selected.marker.setIcon(pinIcon(selected,false)); selected.layer.setStyle({color:'#fff',weight:1.2}); if(!selected.price&&map.getZoom()<14) selected.marker.remove(); }
   selected=s; s.marker.setIcon(pinIcon(s,true)); s.marker.addTo(map); s.marker.setZIndexOffset(1000);
-  if(fly) map.flyTo([s.lat,s.lng],15,{duration:.9});
-  const peers=S.filter(x=>x.district===s.district&&x.price).map(x=>x.price).sort((a,b)=>a-b);
+  s.layer.setStyle({color:'#000',weight:3}); s.layer.bringToFront();
+  if(fly) map.flyToBounds(s.layer.getBounds(),{padding:[30,30],paddingBottomRight:[0,innerHeight*0.35],duration:.9});
+  onZoom();
+  const peers=SUBS.filter(x=>x.district===s.district&&x.price).map(x=>x.price).sort((a,b)=>a-b);
   const dMed=peers.length?peers[Math.floor(peers.length/2)]:null;
+  const km2=(s.area/1e6).toFixed(2);
   let body;
   if(s.price){
-    const diff=(s.price/CITY.house-1)*100, rank=ranked.indexOf(s)+1;
+    const rk=ranked(), diff=(s.price/CITY.house-1)*100, rank=rk.indexOf(s)+1;
     body=`<div class="stats">
       <div class="stat"><div class="k">Median house</div><div class="v">${fmt(s.price)}</div></div>
       <div class="stat"><div class="k">vs Canberra</div><div class="v ${diff>0?'up':'down'}">${diff>0?'+':''}${diff.toFixed(0)}%</div></div>
       <div class="stat"><div class="k">${s.district} median</div><div class="v">${dMed?fmt(dMed):'—'}</div></div>
-      <div class="stat"><div class="k">Price rank</div><div class="v">#${rank} <span style="font-size:12px;color:#888;font-weight:500">of ${ranked.length}</span></div></div>
+      <div class="stat"><div class="k">Price rank</div><div class="v">#${rank} <span style="font-size:12px;color:#888;font-weight:500">of ${rk.length}</span></div></div>
+      <div class="stat"><div class="k">Suburb area</div><div class="v">${km2} km²</div></div>
+      <div class="stat"><div class="k">District</div><div class="v" style="font-size:15px">${s.district}</div></div>
     </div>
     ${NOTES[s.name]?`<div class="note warn">⚠ ${NOTES[s.name]}</div>`:''}
-    <div class="note">Source: <a href="${SRC[s.src].url}">${SRC[s.src].name}</a></div>`;
+    <div class="note">Price source: <a href="${SRC[s.src].url}">${SRC[s.src].name}</a></div>`;
     document.getElementById('pillVal').textContent=fmt(s.price);
   } else {
-    body=`<div class="note" style="font-size:13px;text-align:center">No median house price loaded for ${s.name} yet.${dMed?` ${s.district} district median: <b style="color:#111">${fmt(dMed)}</b>.`:''}</div>`;
+    body=`<div class="stats">
+      <div class="stat"><div class="k">Median house</div><div class="v" style="color:#999">no data yet</div></div>
+      <div class="stat"><div class="k">${s.district} median</div><div class="v">${dMed?fmt(dMed):'—'}</div></div>
+      <div class="stat"><div class="k">Suburb area</div><div class="v">${km2} km²</div></div>
+      <div class="stat"><div class="k">District</div><div class="v" style="font-size:15px">${s.district}</div></div></div>`;
     document.getElementById('pillVal').textContent='—';
   }
-  sheet.innerHTML=`<div class="grab"></div><h2>${s.name}</h2><div class="sub">${s.district} district</div>${body}
+  sheet.innerHTML=`<div class="grab"></div><h2>${s.name}</h2><div class="sub">${s.district}</div>${body}
     <button class="btn" id="back">← All of Canberra</button>`;
   document.getElementById('back').onclick=goHome; setSheetH();
 }
 function goHome(){
-  if(selected){selected.marker.setIcon(pinIcon(selected,false));selected=null;}
+  if(selected){ selected.marker.setIcon(pinIcon(selected,false)); selected.layer.setStyle({color:'#fff',weight:1.2}); selected=null; }
   map.flyToBounds(cityBounds,{duration:.8}); showCity();
 }
 document.getElementById('home').onclick=goHome;
 
-// tapping the map when zoomed in picks the nearest suburb
-map.on('click',e=>{
-  if(map.getZoom()<13) return;
-  let best=null,bd=1e9;
-  S.forEach(s=>{const d=map.distance(e.latlng,[s.lat,s.lng]); if(d<bd){bd=d;best=s;}});
-  if(best && bd<2500) selectSuburb(best,false);
-});
+const legend=`<div class="legend">$400k <i style="background:linear-gradient(90deg,${stops.join(',')})"></i> $2.5M+</div>`;
+function showCity(){
+  const rk=ranked(), row=s=>`<div class="row" data-n="${s.name}"><span>${s.name}</span><b>${fmt(s.price)}</b></div>`;
+  sheet.innerHTML=`<div class="grab"></div>
+    <h2>Canberra</h2>
+    <div class="sub">Median house ${fmt(CITY.house)} · units ${fmt(CITY.unit)} · <span class="down">${CITY.yoy}% / yr</span></div>
+    ${legend}
+    <div class="note" style="text-align:center">${SUBS.length} suburbs · ${rk.length} with price data (grey = no data yet). Tap any suburb.</div>
+    <details style="margin-top:8px"><summary style="font-size:13px;cursor:pointer">Most and least expensive suburbs</summary>
+      ${rk.slice(0,5).map(row).join('')}<div style="height:6px"></div>${rk.slice(-5).reverse().map(row).join('')}
+    </details>
+    <div class="note">City figures: <a href="${CITY.url}">${CITY.src}</a>. Boundaries: Geoscape Administrative Boundaries (2017), CC BY 4.0.</div>`;
+  sheet.querySelectorAll('[data-n]').forEach(el=>el.onclick=()=>selectSuburb(SUBS.find(s=>s.name===el.dataset.n),true));
+  setSheetH(); document.getElementById('pillVal').textContent=fmt(CITY.house);
+}
 
-// ---------- SEARCH ----------
+// ---------- heat toggle ----------
+let fillsOn=true;
+document.getElementById('layers').onclick=()=>{ if(!fillLayer) return; fillsOn=!fillsOn; fillsOn?fillLayer.addTo(map):fillLayer.remove(); };
+
+// ---------- search ----------
 const box=document.getElementById('searchBox'), q=document.getElementById('q'), res=document.getElementById('results');
 document.getElementById('find').onclick=()=>{const open=box.style.display==='block'; box.style.display=open?'none':'block'; if(!open){q.value='';res.innerHTML='';q.focus();}};
 q.addEventListener('input',()=>{
   const t=q.value.trim().toLowerCase(); if(!t){res.innerHTML='';return;}
-  const m=S.filter(s=>s.name.toLowerCase().includes(t)).slice(0,8);
-  res.innerHTML=m.map(s=>`<div data-id="${s.id}">${s.name} <span>· ${s.district}${s.price?' · '+fmt(s.price):''}</span></div>`).join('')||'<div style="color:#888">No match</div>';
-  res.querySelectorAll('[data-id]').forEach(el=>el.onclick=()=>{box.style.display='none';q.blur();selectSuburb(S[+el.dataset.id],true);});
+  const m=SUBS.filter(s=>s.name.toLowerCase().includes(t)).slice(0,8);
+  res.innerHTML=m.map(s=>`<div data-n="${s.name}">${s.name} <span>· ${s.district}${s.price?' · '+fmt(s.price):''}</span></div>`).join('')||'<div style="color:#888">No match</div>';
+  res.querySelectorAll('[data-n]').forEach(el=>el.onclick=()=>{box.style.display='none';q.blur();selectSuburb(SUBS.find(s=>s.name===el.dataset.n),true);});
 });
 
-// ---------- MY LOCATION ----------
+// ---------- my location (point-in-polygon tells you your suburb) ----------
 let me=null;
 document.getElementById('locate').onclick=()=>{
-  if(!navigator.geolocation){return;}
+  if(!navigator.geolocation) return;
   navigator.geolocation.getCurrentPosition(p=>{
-    const ll=[p.coords.latitude,p.coords.longitude];
+    const ll=L.latLng(p.coords.latitude,p.coords.longitude);
     if(me) me.setLatLng(ll); else me=L.circleMarker(ll,{radius:9,color:'#fff',weight:3,fillColor:'#1d6fe0',fillOpacity:1}).addTo(map);
+    const s=suburbAt(ll); if(s) selectSuburb(s,false);
     map.flyTo(ll,15);
   },()=>{},{enableHighAccuracy:true,timeout:10000});
 };
-
-showCity();
 addEventListener('resize',setSheetH);
 </script>
 </body>
